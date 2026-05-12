@@ -1,0 +1,15 @@
+build/
+out/
+DONE/
+Oblivion Runtime Performance/
+Oblivion Runtime Performance.zip
+*.log
+*.user
+*.suo
+*.vcxproj
+*.vcxproj.filters
+*.sln
+*.obj
+*.lib
+*.exp
+*.dll
