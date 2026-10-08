@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <climits>
 #include <cstdarg>
 #include <cstddef>
@@ -12,17 +13,21 @@
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
+#include <cwctype>
 #include <iterator>
-#include <vector>
+#include <limits>
+#include <process.h>
 
 namespace
 {
-constexpr std::uint32_t kPluginVersion = 3;
+constexpr std::uint32_t kPluginVersion = 4; // Release 1.0.1; OBSE uses a monotonic integer.
 constexpr std::uint32_t kPluginInfoVersion = 3;
+constexpr std::uint32_t kMinimumXObseVersion = 22;
 constexpr std::uint32_t kOblivionVersion_1_2_416 = 0x010201A0;
 constexpr ULONG kDesiredTimerResolution100ns = 5000; // 0.5 ms in 100 ns units.
 constexpr DWORD kDefaultMaintenanceIntervalMs = 5 * 60 * 1000;
 constexpr DWORD kMinimumMaintenanceIntervalMs = 30 * 1000;
+constexpr DWORD kMaximumMaintenanceIntervalSeconds = (MAXDWORD - 1) / 1000;
 constexpr ULONG kProcessIoPriorityClass = 33;
 constexpr ULONG kIoPriorityNormal = 2;
 constexpr ULONG kIoPriorityHigh = 3;
@@ -125,10 +130,10 @@ struct RuntimeOptions
     bool processAffinity = true;
     DWORD_PTR processAffinityMask = 0;
     bool mainThreadHighestPriority = true;
-    bool mainThreadIdealProcessor = true;
+    bool mainThreadIdealProcessor = false;
     bool mainThreadHardPin = false;
     bool lowFragmentationHeap = true;
-    bool workingSetPurge = true;
+    bool workingSetPurge = false;
     bool ioPriorityBoost = true;
     bool powerThrottlingDisable = true;
     DWORD maintenanceIntervalMs = kDefaultMaintenanceIntervalMs;
@@ -151,14 +156,30 @@ RuntimeOptions g_options;
 PluginHandle g_pluginHandle = kPluginHandleInvalid;
 OBSEMessagingInterface* g_messaging = nullptr;
 std::atomic_bool g_initialized{false};
+bool g_activated = false; // Guarded by g_runtimeLock.
 std::atomic_bool g_running{false};
 UINT g_timePeriod = 0;
 bool g_timerResolutionSet = false;
 ULONG g_timerResolutionRequest100ns = kDesiredTimerResolution100ns;
 NtSetTimerResolutionFn g_ntSetTimerResolution = nullptr;
+SRWLOCK g_logLock = SRWLOCK_INIT;
+SRWLOCK g_runtimeLock = SRWLOCK_INIT;
+SRWLOCK g_threadLock = SRWLOCK_INIT;
+
+struct ExclusiveLock
+{
+    explicit ExclusiveLock(SRWLOCK& lock) : lock_(lock) { AcquireSRWLockExclusive(&lock_); }
+    ~ExclusiveLock() { ReleaseSRWLockExclusive(&lock_); }
+    ExclusiveLock(const ExclusiveLock&) = delete;
+    ExclusiveLock& operator=(const ExclusiveLock&) = delete;
+    SRWLOCK& lock_;
+};
 
 void ReapplyMainThreadHints();
-void ShutdownRuntime(bool waitForWorker, bool writeCloseMessage);
+void ApplyMainThreadHints();
+void StartMaintenance();
+void ActivateRuntimeTuning();
+void ShutdownRuntime();
 
 bool NtSuccess(LONG status)
 {
@@ -173,19 +194,33 @@ bool BuildPluginSiblingPath(const wchar_t* fileName, wchar_t* output, DWORD outp
     }
 
     output[0] = L'\0';
-    if (!GetModuleFileNameW(g_instance, output, outputCount))
+    if (!fileName)
     {
+        return false;
+    }
+    const DWORD length = GetModuleFileNameW(g_instance, output, outputCount);
+    if (!length || length >= outputCount)
+    {
+        output[0] = L'\0';
         return false;
     }
 
     wchar_t* slash = std::wcsrchr(output, L'\\');
     if (!slash)
     {
+        output[0] = L'\0';
         return false;
     }
 
-    *(slash + 1) = L'\0';
-    return wcscat_s(output, outputCount, fileName) == 0;
+    const std::size_t directoryLength = static_cast<std::size_t>(slash + 1 - output);
+    const std::size_t nameLength = std::wcslen(fileName);
+    if (nameLength >= outputCount - directoryLength)
+    {
+        output[0] = L'\0';
+        return false;
+    }
+    std::wmemcpy(output + directoryLength, fileName, nameLength + 1);
+    return true;
 }
 
 void Log(const char* format, ...)
@@ -214,6 +249,7 @@ void Log(const char* format, ...)
     OutputDebugStringA(message);
     OutputDebugStringA("\n");
 
+    ExclusiveLock lock(g_logLock);
     if (g_logFile != INVALID_HANDLE_VALUE)
     {
         DWORD written = 0;
@@ -224,33 +260,31 @@ void Log(const char* format, ...)
 
 void OpenLog()
 {
-    if (g_logFile != INVALID_HANDLE_VALUE)
     {
-        CloseHandle(g_logFile);
-        g_logFile = INVALID_HANDLE_VALUE;
+        ExclusiveLock lock(g_logLock);
+        if (g_logFile != INVALID_HANDLE_VALUE)
+        {
+            return;
+        }
+        wchar_t path[MAX_PATH]{};
+        if (!BuildPluginSiblingPath(L"OblivionPerformanceRuntime.log", path, MAX_PATH))
+        {
+            return;
+        }
+        g_logFile = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     }
-
-    wchar_t path[MAX_PATH]{};
-    if (!BuildPluginSiblingPath(L"OblivionPerformanceRuntime.log", path, MAX_PATH))
-    {
-        return;
-    }
-
-    g_logFile = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (g_logFile != INVALID_HANDLE_VALUE)
-    {
-        Log("log opened");
-    }
+    Log("log opened (plugin version %u)", kPluginVersion);
 }
 
 void CloseLog(bool writeCloseMessage)
 {
+    if (writeCloseMessage)
+    {
+        Log("log closed");
+    }
+    ExclusiveLock lock(g_logLock);
     if (g_logFile != INVALID_HANDLE_VALUE)
     {
-        if (writeCloseMessage)
-        {
-            Log("log closed");
-        }
         CloseHandle(g_logFile);
         g_logFile = INVALID_HANDLE_VALUE;
     }
@@ -266,14 +300,55 @@ bool ReadIniBool(const wchar_t* iniPath, const wchar_t* key, bool defaultValue)
     return ReadIniInt(iniPath, key, defaultValue ? 1 : 0) != 0;
 }
 
+bool ParseUnsigned(const wchar_t* raw, unsigned long long maximum, unsigned long long& value, bool allowHex)
+{
+    while (std::iswspace(*raw))
+    {
+        ++raw;
+    }
+    if (*raw < L'0' || *raw > L'9')
+    {
+        return false;
+    }
+    const int base = allowHex && raw[0] == L'0' && (raw[1] == L'x' || raw[1] == L'X') ? 16 : 10;
+    errno = 0;
+    wchar_t* end = nullptr;
+    const auto parsed = std::wcstoull(raw, &end, base);
+    if (end == raw || errno == ERANGE || parsed > maximum)
+    {
+        return false;
+    }
+    while (std::iswspace(*end))
+    {
+        ++end;
+    }
+    if (*end != L'\0')
+    {
+        return false;
+    }
+    value = parsed;
+    return true;
+}
+
+DWORD ParseMaintenanceInterval(const wchar_t* raw)
+{
+    unsigned long long seconds = 0;
+    if (!ParseUnsigned(raw, (std::numeric_limits<unsigned long long>::max)(), seconds, false))
+    {
+        Log("invalid MaintenanceIntervalSeconds; using 300 seconds");
+        return kDefaultMaintenanceIntervalMs;
+    }
+    seconds = std::clamp(seconds, static_cast<unsigned long long>(kMinimumMaintenanceIntervalMs / 1000),
+        static_cast<unsigned long long>(kMaximumMaintenanceIntervalSeconds));
+    return static_cast<DWORD>(seconds * 1000ULL);
+}
+
 DWORD_PTR ReadIniAffinityMask(const wchar_t* iniPath)
 {
     wchar_t raw[64]{};
-    GetPrivateProfileStringW(L"Tuning", L"ProcessAffinityMask", L"0", raw, static_cast<DWORD>(std::size(raw)), iniPath);
-
-    wchar_t* end = nullptr;
-    const unsigned long long value = std::wcstoull(raw, &end, 0);
-    if (end == raw)
+    const DWORD length = GetPrivateProfileStringW(L"Tuning", L"ProcessAffinityMask", L"0", raw, static_cast<DWORD>(std::size(raw)), iniPath);
+    unsigned long long value = 0;
+    if (length >= std::size(raw) - 1 || !ParseUnsigned(raw, (std::numeric_limits<DWORD_PTR>::max)(), value, true))
     {
         Log("invalid ProcessAffinityMask value; using current process mask");
         return 0;
@@ -309,9 +384,10 @@ RuntimeOptions LoadOptions()
     options.ioPriorityBoost = ReadIniBool(iniPath, L"IoPriorityBoost", options.ioPriorityBoost);
     options.powerThrottlingDisable = ReadIniBool(iniPath, L"PowerThrottlingDisable", options.powerThrottlingDisable);
 
-    const int intervalSeconds = ReadIniInt(iniPath, L"MaintenanceIntervalSeconds", static_cast<int>(kDefaultMaintenanceIntervalMs / 1000));
-    const DWORD intervalMs = static_cast<DWORD>(std::max(intervalSeconds, 1) * 1000);
-    options.maintenanceIntervalMs = std::max(intervalMs, kMinimumMaintenanceIntervalMs);
+    wchar_t interval[64]{};
+    const DWORD intervalLength = GetPrivateProfileStringW(L"Tuning", L"MaintenanceIntervalSeconds", L"300", interval,
+        static_cast<DWORD>(std::size(interval)), iniPath);
+    options.maintenanceIntervalMs = ParseMaintenanceInterval(intervalLength >= std::size(interval) - 1 ? L"" : interval);
 
     Log(
         "options: priority=%d timer=%d affinity=%d affinityMask=0x%Ix mainThreadPriority=%d idealCpu=%d hardPin=%d lfh=%d purge=%d io=%d power=%d intervalMs=%lu",
@@ -350,60 +426,51 @@ bool IsWow64ProcessCompat(HANDLE process)
     return IsWow64Process(process, &wow64) && wow64;
 }
 
-bool CurrentExeIsLargeAddressAware()
+enum class AddressAwareness { Unknown, Disabled, Enabled };
+
+AddressAwareness ReadImageAddressAwareness(const void* image, std::size_t available)
 {
-    char path[MAX_PATH]{};
-    if (!GetModuleFileNameA(nullptr, path, MAX_PATH))
+    if (!image || available < sizeof(IMAGE_DOS_HEADER))
     {
-        return false;
+        return AddressAwareness::Unknown;
     }
-
-    HANDLE file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE)
+    IMAGE_DOS_HEADER dos{};
+    std::memcpy(&dos, image, sizeof(dos));
+    if (dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew < static_cast<LONG>(sizeof(dos)))
     {
-        return false;
+        return AddressAwareness::Unknown;
     }
-
-    LARGE_INTEGER fileSize{};
-    if (!GetFileSizeEx(file, &fileSize))
+    const auto offset = static_cast<std::size_t>(dos.e_lfanew);
+    if (offset > available || available - offset < sizeof(IMAGE_NT_HEADERS32))
     {
-        CloseHandle(file);
-        return false;
+        return AddressAwareness::Unknown;
     }
-
-    HANDLE mapping = CreateFileMappingA(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
-    if (!mapping)
+    IMAGE_NT_HEADERS32 nt{};
+    std::memcpy(&nt, static_cast<const std::uint8_t*>(image) + offset, sizeof(nt));
+    if (nt.Signature != IMAGE_NT_SIGNATURE || nt.FileHeader.Machine != IMAGE_FILE_MACHINE_I386
+        || nt.FileHeader.SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER32)
+        || nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC)
     {
-        CloseHandle(file);
-        return false;
+        return AddressAwareness::Unknown;
     }
+    return (nt.FileHeader.Characteristics & IMAGE_FILE_LARGE_ADDRESS_AWARE)
+        ? AddressAwareness::Enabled : AddressAwareness::Disabled;
+}
 
-    auto* base = static_cast<const std::uint8_t*>(MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0));
-    bool aware = false;
-    if (base && fileSize.QuadPart >= static_cast<LONGLONG>(sizeof(IMAGE_DOS_HEADER)))
+AddressAwareness CurrentExeAddressAwareness()
+{
+    // Inspect the running image, independent of Unicode paths, sharing permissions,
+    // or replacement of the executable on disk. Restrict parsing to readable headers.
+    HMODULE image = GetModuleHandleW(nullptr);
+    MEMORY_BASIC_INFORMATION region{};
+    if (!image || !VirtualQuery(image, &region, sizeof(region)) || region.State != MEM_COMMIT
+        || region.BaseAddress != image || (region.Protect & (PAGE_NOACCESS | PAGE_GUARD))
+        || !(region.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY
+            | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
     {
-        auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-        const LONGLONG ntOffset = dos->e_lfanew;
-        if (dos->e_magic == IMAGE_DOS_SIGNATURE &&
-            ntOffset > 0 &&
-            ntOffset + static_cast<LONGLONG>(sizeof(IMAGE_NT_HEADERS32)) <= fileSize.QuadPart)
-        {
-            auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(base + ntOffset);
-            if (nt->Signature == IMAGE_NT_SIGNATURE)
-            {
-                aware = (nt->FileHeader.Characteristics & IMAGE_FILE_LARGE_ADDRESS_AWARE) != 0;
-            }
-        }
+        return AddressAwareness::Unknown;
     }
-
-    if (base)
-    {
-        UnmapViewOfFile(base);
-    }
-
-    CloseHandle(mapping);
-    CloseHandle(file);
-    return aware;
+    return ReadImageAddressAwareness(image, region.RegionSize);
 }
 
 DWORD CountAffinityBits(DWORD_PTR mask)
@@ -443,14 +510,9 @@ void CaptureMainThreadHandle()
     }
 }
 
-HANDLE MainThreadHandleForCurrentCall()
-{
-    return g_mainThread ? g_mainThread : GetCurrentThread();
-}
-
 void HandleOBSEMessage(OBSEMessagingInterface::Message* message)
 {
-    if (!message)
+    if (!message || !message->sender || std::strcmp(message->sender, "OBSE") != 0)
     {
         return;
     }
@@ -458,14 +520,21 @@ void HandleOBSEMessage(OBSEMessagingInterface::Message* message)
     switch (message->type)
     {
         case kMessage_GameInitialized:
+        {
+            ExclusiveLock lock(g_runtimeLock);
+            if (!g_initialized.load() || g_activated)
+            {
+                break;
+            }
             Log("received OBSE game initialized message");
-            ReapplyMainThreadHints();
+            ActivateRuntimeTuning();
             break;
+        }
 
         case kMessage_ExitGame:
         case kMessage_ExitGame_Console:
             Log("received OBSE exit message; shutting down runtime tuning");
-            ShutdownRuntime(true, true);
+            ShutdownRuntime();
             break;
 
         default:
@@ -473,50 +542,43 @@ void HandleOBSEMessage(OBSEMessagingInterface::Message* message)
     }
 }
 
-void RegisterOBSEMessaging(const OBSEInterface* obse)
+bool RegisterOBSEMessaging(const OBSEInterface* obse)
 {
-    if (!obse)
+    if (!obse || !obse->GetPluginHandle || !obse->QueryInterface)
     {
-        Log("OBSE interface is null; messaging unavailable");
-        return;
+        Log("required xOBSE interface functions are missing");
+        return false;
     }
 
     Log("OBSE version=%lu Oblivion version=0x%08lX", obse->obseVersion, obse->oblivionVersion);
-    if (obse->oblivionVersion && obse->oblivionVersion != kOblivionVersion_1_2_416)
+    g_pluginHandle = obse->GetPluginHandle();
+    Log("plugin handle=%lu", g_pluginHandle);
+    if (g_pluginHandle == kPluginHandleInvalid)
     {
-        Log("unexpected Oblivion runtime version; process tuning will continue without address hooks");
-    }
-
-    if (obse->obseVersion >= 15 && obse->GetPluginHandle)
-    {
-        g_pluginHandle = obse->GetPluginHandle();
-        Log("plugin handle=%lu", g_pluginHandle);
-    }
-
-    if (obse->obseVersion < 17 || !obse->QueryInterface || g_pluginHandle == kPluginHandleInvalid)
-    {
-        Log("OBSE messaging unavailable; DllMain will provide fallback cleanup");
-        return;
+        Log("xOBSE returned an invalid plugin handle");
+        return false;
     }
 
     g_messaging = static_cast<OBSEMessagingInterface*>(obse->QueryInterface(kInterface_Messaging));
     if (!g_messaging || g_messaging->version < 1 || !g_messaging->RegisterListener)
     {
-        Log("OBSE messaging interface missing or unsupported");
-        return;
+        Log("required xOBSE messaging interface is missing or unsupported");
+        return false;
     }
 
     if (g_messaging->RegisterListener(g_pluginHandle, "OBSE", HandleOBSEMessage))
     {
         Log("registered OBSE messaging listener");
+        return true;
     }
     else
     {
         Log("failed to register OBSE messaging listener");
+        return false;
     }
 }
 
-void ApplyPriorityAndAffinity()
+void ApplyProcessPriorityAndAffinity()
 {
     HANDLE process = GetCurrentProcess();
 
@@ -535,34 +597,53 @@ void ApplyPriorityAndAffinity()
     DWORD_PTR processMask = 0;
     DWORD_PTR systemMask = 0;
     DWORD_PTR effectiveMask = 0;
-    if (g_options.processAffinity && GetProcessAffinityMask(process, &processMask, &systemMask))
+    if (GetProcessAffinityMask(process, &processMask, &systemMask))
     {
-        effectiveMask = g_options.processAffinityMask ? (g_options.processAffinityMask & systemMask) : processMask;
-        if (!effectiveMask)
+        effectiveMask = processMask;
+        // A zero mask preserves the existing policy without issuing a redundant setter.
+        if (g_options.processAffinity && g_options.processAffinityMask)
         {
-            effectiveMask = systemMask;
-        }
-
-        if (effectiveMask && SetProcessAffinityMask(process, effectiveMask))
-        {
-            Log(
-                "process affinity mask applied: requested=0x%Ix system=0x%Ix effective=0x%Ix",
-                static_cast<std::size_t>(g_options.processAffinityMask),
-                static_cast<std::size_t>(systemMask),
-                static_cast<std::size_t>(effectiveMask));
-        }
-        else if (effectiveMask)
-        {
-            Log("SetProcessAffinityMask failed: %lu", GetLastError());
+            const DWORD_PTR requested = g_options.processAffinityMask;
+            if ((requested & systemMask) != requested)
+            {
+                Log("ProcessAffinityMask contains unavailable CPUs; preserving current mask");
+            }
+            else if (!SetProcessAffinityMask(process, requested))
+            {
+                Log("SetProcessAffinityMask failed: %lu; using current mask", GetLastError());
+            }
+            // Re-read after either success or failure; never select a CPU from an unapplied mask.
+            if (!GetProcessAffinityMask(process, &effectiveMask, &systemMask))
+            {
+                effectiveMask = 0;
+                Log("unable to refresh process affinity: %lu; thread hints will query again at game initialization", GetLastError());
+            }
+            else
+            {
+                Log("current process affinity mask: 0x%Ix", static_cast<std::size_t>(effectiveMask));
+            }
         }
     }
+    else
+    {
+        Log("GetProcessAffinityMask failed: %lu; process affinity unchanged", GetLastError());
+    }
 
-    HANDLE mainThread = MainThreadHandleForCurrentCall();
+}
+
+// Caller owns g_threadLock. Only target the thread captured by GameInitialized.
+void ApplyMainThreadHints()
+{
+    if (!g_mainThread)
+    {
+        return;
+    }
+    HANDLE mainThread = g_mainThread;
     if (g_options.mainThreadHighestPriority)
     {
         if (SetThreadPriority(mainThread, THREAD_PRIORITY_HIGHEST))
         {
-            Log("main thread %lu priority set to THREAD_PRIORITY_HIGHEST", g_mainThreadId);
+            Log("game main thread %lu priority set to THREAD_PRIORITY_HIGHEST", g_mainThreadId);
         }
         else
         {
@@ -570,8 +651,15 @@ void ApplyPriorityAndAffinity()
         }
     }
 
-    if (!effectiveMask)
+    if (!g_options.mainThreadIdealProcessor && !g_options.mainThreadHardPin)
     {
+        return;
+    }
+    DWORD_PTR effectiveMask = 0;
+    DWORD_PTR systemMask = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &effectiveMask, &systemMask) || !effectiveMask)
+    {
+        Log("unable to read current process affinity; skipping thread CPU hints");
         return;
     }
 
@@ -692,25 +780,18 @@ void ApplyHeapLowFragmentationMode()
         return;
     }
 
-    DWORD heapCount = GetProcessHeaps(0, nullptr);
-    if (!heapCount)
-    {
-        return;
-    }
-
-    std::vector<HANDLE> heaps(heapCount);
-    heapCount = GetProcessHeaps(heapCount, heaps.data());
+    // Oblivion's FormHeap/MemoryPool allocator is separate from the Windows default heap.
+    // Other DLLs own private heaps whose lifetime we cannot synchronize with.
+    HANDLE heap = GetProcessHeap();
     ULONG lfh = 2;
-    DWORD enabled = 0;
-    for (DWORD i = 0; i < heapCount; ++i)
+    if (heap && HeapSetInformation(heap, HeapCompatibilityInformation, &lfh, sizeof(lfh)))
     {
-        if (HeapSetInformation(heaps[i], HeapCompatibilityInformation, &lfh, sizeof(lfh)))
-        {
-            ++enabled;
-        }
+        Log("LFH requested on Windows default process heap only");
     }
-
-    Log("LFH requested on %lu/%lu process heaps", enabled, heapCount);
+    else
+    {
+        Log("default process heap LFH request failed: %lu", GetLastError());
+    }
 }
 
 void ApplyIoPriority()
@@ -817,6 +898,7 @@ void TrimWorkingSet()
 
 void ReapplyMainThreadHints()
 {
+    ExclusiveLock lock(g_threadLock);
     if (!g_mainThread)
     {
         return;
@@ -833,18 +915,17 @@ void ReapplyMainThreadHints()
     }
 }
 
-DWORD WINAPI MaintenanceThread(void*)
+unsigned __stdcall MaintenanceThread(void*)
 {
     while (g_running.load(std::memory_order_acquire))
     {
         const DWORD waitResult = WaitForSingleObject(g_stopEvent, g_options.maintenanceIntervalMs);
-        if (waitResult != WAIT_TIMEOUT)
+        if (waitResult != WAIT_TIMEOUT || !g_running.load(std::memory_order_acquire))
         {
             break;
         }
 
         ReapplyMainThreadHints();
-        ApplyHeapLowFragmentationMode();
         TrimWorkingSet();
     }
     return 0;
@@ -852,6 +933,10 @@ DWORD WINAPI MaintenanceThread(void*)
 
 void StartMaintenance()
 {
+    if (!g_options.workingSetPurge && !(g_mainThread && (g_options.mainThreadHighestPriority || g_mainThreadPinMask)))
+    {
+        return;
+    }
     if (g_running.exchange(true))
     {
         return;
@@ -865,13 +950,14 @@ void StartMaintenance()
         return;
     }
 
-    g_worker = CreateThread(nullptr, 0, MaintenanceThread, nullptr, 0, nullptr);
+    g_worker = reinterpret_cast<HANDLE>(_beginthreadex(nullptr, 0, MaintenanceThread, nullptr, 0, nullptr));
     if (!g_worker)
     {
+        const int error = errno;
         CloseHandle(g_stopEvent);
         g_stopEvent = nullptr;
         g_running.store(false);
-        Log("CreateThread for maintenance failed: %lu", GetLastError());
+        Log("_beginthreadex for maintenance failed: errno=%d", error);
         return;
     }
 
@@ -879,23 +965,23 @@ void StartMaintenance()
     Log("maintenance thread started; interval=%lums", g_options.maintenanceIntervalMs);
 }
 
-void StopMaintenance(bool waitForWorker)
+bool StopMaintenance()
 {
-    if (!g_running.exchange(false))
-    {
-        return;
-    }
+    g_running.store(false, std::memory_order_release);
 
-    if (g_stopEvent)
+    if (g_stopEvent && !SetEvent(g_stopEvent))
     {
-        SetEvent(g_stopEvent);
+        Log("unable to signal maintenance shutdown: %lu; retaining resources", GetLastError());
+        return false;
     }
 
     if (g_worker)
     {
-        if (waitForWorker)
+        // Only called outside DllMain. A timeout must never authorize closing live resources.
+        if (WaitForSingleObject(g_worker, INFINITE) != WAIT_OBJECT_0)
         {
-            WaitForSingleObject(g_worker, 2000);
+            Log("unable to join maintenance thread: %lu; retaining resources", GetLastError());
+            return false;
         }
         CloseHandle(g_worker);
         g_worker = nullptr;
@@ -906,10 +992,12 @@ void StopMaintenance(bool waitForWorker)
         CloseHandle(g_stopEvent);
         g_stopEvent = nullptr;
     }
+    return true;
 }
 
 void CloseMainThreadHandle()
 {
+    ExclusiveLock lock(g_threadLock);
     if (g_mainThread)
     {
         CloseHandle(g_mainThread);
@@ -917,47 +1005,84 @@ void CloseMainThreadHandle()
     }
 }
 
-void ApplyRuntimeTuning(const OBSEInterface* obse)
+// Called under g_runtimeLock by the required xOBSE main-loop notification.
+void ActivateRuntimeTuning()
 {
+    ApplyProcessPriorityAndAffinity();
+    ApplyTimerResolution();
+    ApplyHeapLowFragmentationMode();
+    ApplyIoPriority();
+    DisablePowerThrottling();
+    {
+        ExclusiveLock threadLock(g_threadLock);
+        CaptureMainThreadHandle();
+        ApplyMainThreadHints();
+    }
+    g_activated = true;
+    StartMaintenance();
+}
+
+bool InitializeRuntime(const OBSEInterface* obse)
+{
+    ExclusiveLock lock(g_runtimeLock);
     if (g_initialized.exchange(true))
     {
         Log("runtime tuning already initialized");
-        return;
+        return true;
     }
 
     OpenLog();
     g_options = LoadOptions();
-    RegisterOBSEMessaging(obse);
-    CaptureMainThreadHandle();
+    if (!RegisterOBSEMessaging(obse))
+    {
+        Log("runtime tuning rejected: xOBSE messaging is required");
+        CloseLog(true);
+        g_initialized.store(false);
+        return false;
+    }
+    Log("all tuning awaits GameInitialized (requires xOBSE 22.10 or newer)");
 
     const bool wow64 = IsWow64ProcessCompat(GetCurrentProcess());
-    const bool largeAddressAware = CurrentExeIsLargeAddressAware();
-    Log("64-bit OS/WOW64: %s; Large Address Aware: %s", wow64 ? "yes" : "no", largeAddressAware ? "yes" : "no");
-    if (!largeAddressAware)
+    const auto largeAddressAware = CurrentExeAddressAwareness();
+    Log("64-bit OS/WOW64: %s; Large Address Aware: %s", wow64 ? "yes" : "no",
+        largeAddressAware == AddressAwareness::Unknown ? "unknown" :
+        (largeAddressAware == AddressAwareness::Enabled ? "yes" : "no"));
+    if (largeAddressAware == AddressAwareness::Disabled)
     {
         Log("Oblivion.exe is not Large Address Aware. Apply a 4GB patch before expecting >2GB address space.");
     }
     ReportDepPolicy();
 
-    ApplyPriorityAndAffinity();
-    ApplyTimerResolution();
-    ApplyHeapLowFragmentationMode();
-    ApplyIoPriority();
-    DisablePowerThrottling();
-    StartMaintenance();
+    return true;
 }
 
-void ShutdownRuntime(bool waitForWorker, bool writeCloseMessage)
+void ShutdownRuntime()
 {
-    if (!g_initialized.exchange(false))
+    ExclusiveLock lock(g_runtimeLock);
+    if (!g_initialized.load())
     {
         return;
     }
 
-    StopMaintenance(waitForWorker);
+    if (!StopMaintenance())
+    {
+        return;
+    }
     ReleaseTimerResolution();
     CloseMainThreadHandle();
-    CloseLog(writeCloseMessage);
+    g_mainThreadPinMask = 0;
+    g_activated = false;
+    CloseLog(true);
+    g_initialized.store(false);
+}
+
+bool IsSupportedRuntime(const OBSEInterface* obse)
+{
+    // The public interface exposes the major version only. GameInitialized,
+    // introduced in xOBSE 22.10, is required to activate any tuning.
+    return obse && !obse->isEditor && obse->obseVersion >= kMinimumXObseVersion
+        && obse->oblivionVersion == kOblivionVersion_1_2_416
+        && obse->QueryInterface && obse->GetPluginHandle;
 }
 }
 
@@ -970,41 +1095,36 @@ extern "C" __declspec(dllexport) bool OBSEPlugin_Query(const OBSEInterface* obse
         info->version = kPluginVersion;
     }
 
-    if (!obse)
-    {
-        return false;
-    }
-
-    if (obse && obse->isEditor)
-    {
-        return false;
-    }
-
-    return true;
+    return info && IsSupportedRuntime(obse);
 }
 
 extern "C" __declspec(dllexport) bool OBSEPlugin_Load(const OBSEInterface* obse)
 {
-    if (!obse || obse->isEditor)
+    if (!IsSupportedRuntime(obse))
     {
         return false;
     }
 
-    ApplyRuntimeTuning(obse);
-    return true;
+    // OBSE callbacks cannot be unregistered. Keep their code and any worker mapped for
+    // the process lifetime, including if an external caller attempts FreeLibrary.
+    HMODULE pinnedModule = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+        reinterpret_cast<LPCWSTR>(&g_instance), &pinnedModule))
+    {
+        return false;
+    }
+    return InitializeRuntime(obse);
 }
 
-BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
+BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH)
     {
         g_instance = instance;
-        DisableThreadLibraryCalls(instance);
     }
-    else if (reason == DLL_PROCESS_DETACH)
-    {
-        ShutdownRuntime(reserved == nullptr, false);
-    }
+
+    // Keep CRT thread notifications. Normal cleanup runs through OBSE messaging;
+    // abrupt process termination is left to Windows, with no loader-lock waits.
 
     return TRUE;
 }

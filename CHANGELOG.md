@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.0.1
+
+OBSE plugin version integer: 4 (previous release reported 3).
+
+- Restrict LFH requests to the Windows default heap at startup; remove private-heap enumeration.
+- Join maintenance fully before releasing its resources, and retain resources on shutdown API failure.
+- Keep the DLL resident for registered callbacks; remove blocking teardown from DllMain and retain static CRT thread notifications.
+- Use `_beginthreadex` for the CRT-using worker and serialize log-file access.
+- Reject invalid affinity masks and safely clamp maintenance intervals before multiplication.
+- Apply thread affinity options independently of process-affinity changes; re-query the effective mask after requests.
+- Default ideal-processor hints and working-set purging to off in code; skip workers with no periodic tasks. The bundled INI is unchanged and explicitly overrides those defaults; set both options to 0 to adopt them.
+- Verify with local regression checks and read-only inspection of the open Oblivion IDA database. The development test harness is not included in this update.
+- Require xOBSE 22.10+ on Oblivion 1.2.0416. Reject classic OBSE, other game versions and missing messaging; defer all tuning until GameInitialized instead of targeting a temporary loading thread.
+- Synchronize callback thread capture with maintenance, and ignore non-OBSE messages.
+- Guard sibling-path capacity before copying and inspect LAA on the running image with an explicit unknown state.
+- Verify loader/main-thread separation, return-to-menu behavior, unsupported-loader rejection, and path/header edge cases.
+
 ## 1.0.0
 
 Initial release.
